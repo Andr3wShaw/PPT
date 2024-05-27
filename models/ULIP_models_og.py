@@ -439,7 +439,6 @@ def ULIP_PN_MLP(args):
 
     return model
 
-
 def ULIP_PointBERT(args):
     # NOTE for prompting ULIP, we do not need image encoder. Text and point encoder is enough.
     # vision_model = timm.create_model('vit_base_patch16_224', num_classes=0)
@@ -485,7 +484,7 @@ def ULIP_PointBERT(args):
                                       pretrain_slip_model_params.items()}
 
         for name, param in model.named_parameters():    # `model` does not have parameter for image encoder
-            if name == 'prompt_learner_text.learnable_tokens' or 'prompt_learner_3d.learnable_tokens' or 'point_encoder.cls_head' in name: 
+            if name == 'prompt_learner.learnable_tokens' or 'point_encoder.cls_head' in name: 
                 continue
 
             if name in unfreeze_modules:  # 打开 transformer 最后一个 block，让参数更新
