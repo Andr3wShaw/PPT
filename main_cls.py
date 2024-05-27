@@ -28,6 +28,7 @@ from utils import utils
 
 
 def main(args):
+    print("Initializing distributed mode...")
     utils.init_distributed_mode(args)
 
     if utils.is_main_process() and args.wandb:
@@ -36,19 +37,21 @@ def main(args):
         wandb.init(project=args.proj_name, name=args.exp_name)
 
     # fix the seed for reproducibility
+    print("Setting random seed...")
     seed = args.seed + utils.get_rank()
     set_random_seed(seed)
 
     # create model
-    print("=> creating model: {}".format(args.model))
+    print(f"=> creating model: {args.model}")
     model = getattr(models, args.model)(args)
     model.cuda(args.gpu)
 
     if args.distributed:
-        # `find_unused_parameters=False`
+        print("Wrapping model with DDP...")
         model = DDP(model, device_ids=[args.gpu], find_unused_parameters=False)
 
     # define loss function (criterion) and optimizer
+    print("Setting up loss and optimizer...")
     criterion = CrossEntropyLoss(label_smoothing=args.label_smoothing).cuda(args.gpu)
 
     if args.optim == 'sgd':
@@ -62,14 +65,14 @@ def main(args):
     cudnn.benchmark = True
 
     # Data loading code
-    print("=> creating dataset")
+    print("Creating dataset...")
     tokenizer = SimpleTokenizer()
 
     # do not use `train_transform`
     train_dataset = get_dataset(None, tokenizer, args, 'train')
     val_dataset = get_dataset(None, tokenizer, args, 'test')
-    print('------ len(train_dataset)', len(train_dataset))
-    print('------ len(val_dataset)', len(val_dataset))
+    print(f'------ len(train_dataset): {len(train_dataset)}')
+    print(f'------ len(val_dataset): {len(val_dataset)}')
 
     if args.distributed:
         train_sampler = DistributedSampler(train_dataset)
@@ -78,6 +81,7 @@ def main(args):
         train_sampler = None
         val_sampler = None
 
+    print("Creating data loaders...")
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=False)
@@ -103,11 +107,11 @@ def main(args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
+        print(f"Training epoch {epoch}...")
         train_stats = train(train_loader, model, criterion, optimizer, epoch, lr_scheduler, args)
         val_stats = {"acc": -1}
 
-        # lr_scheduler.step()
-
+        print(f"Validating epoch {epoch}...")
         val_stats = validate(val_loader, model, criterion, args)
         acc = val_stats["acc"]
         print(val_stats)
@@ -118,12 +122,10 @@ def main(args):
         if args.distributed:
             state_dict_prompt = model.module.prompt_learner.state_dict()
             if 'pointbert' in args.model.lower():
-                # last transformer block
                 state_dict_block = model.module.point_encoder.blocks.blocks[-1].state_dict()
         else:
             state_dict_prompt = model.prompt_learner.state_dict()
             if 'pointbert' in args.model.lower():
-                # last transformer block
                 state_dict_block = model.point_encoder.blocks.blocks[-1].state_dict()
 
         if is_best:
@@ -148,50 +150,43 @@ def main(args):
                 
     if utils.is_main_process():
         wandb.finish()
-        # copy log file from pueue to outputs/${proj_name}/${exp_name}
         utils.copy_log_from_pueue(args.output_dir, args.proj_name, args.exp_name, 'run.log')
 
 
 def train(train_loader, model, criterion, optimizer, epoch, lr_scheduler, args):
+    print("Starting training...")
     batch_time = AverageMeter('Time', ':6.2f')
     data_time = AverageMeter('Data', ':6.2f')
     mem = AverageMeter('Mem (GB)', ':6.1f')
     metric_names = models.get_metric_names()
     iters_per_epoch = len(train_loader) // args.update_freq
-    # loss & acc
     metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in metric_names])
     progress = ProgressMeter(
         iters_per_epoch,
         [batch_time, data_time, mem, *metrics.values()],
         prefix="Epoch: [{}]".format(epoch))
 
-    # switch to train mode
     model.train()
-
     end = time.time()
     for data_iter, inputs in enumerate(train_loader):
-        if data_iter > len(train_loader) * args.data_ratio: # dr: data_ratio
+        if data_iter > len(train_loader) * args.data_ratio: 
             break
 
-        # measure data loading time
         data_time.update(time.time() - end)
-
         optimizer.zero_grad()
-        # update weight decay and learning rate according to their schedule
         optim_iter = data_iter // args.update_freq
-
         it = iters_per_epoch * epoch + optim_iter  # global training iteration
+
         for _, param_group in enumerate(optimizer.param_groups):
             param_group['lr'] = lr_scheduler[it]
 
-        # pc: [batch, npoints, 3]
-        pc = inputs[0]
-        pc = pc.to(args.gpu)
-        # label: [batch, ]
+        pc = inputs[0].to(args.gpu)
         label = inputs[1].long().to(args.gpu)
-
-        # [batch, num_classes]
         pred = model(pc)
+        
+        print(f"pred shape: {pred.shape}")
+        print(f"label shape: {label.shape}")
+
         loss = criterion(pred, label)
 
         loss.backward(retain_graph=True)
@@ -201,31 +196,24 @@ def train(train_loader, model, criterion, optimizer, epoch, lr_scheduler, args):
         correct = torch.eq(pred_idx, label).sum()
         acc = correct / len(label)
 
-        # NOTE check whether `loss` is exploded
         if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()))
+            print(f"Loss is {loss.item()}, stopping training")
             sys.exit(1)
 
         if (data_iter + 1) % args.update_freq != 0:
             continue
 
-        # clamp logit scale to [0, 100]
         utils.get_model(model).logit_scale.data.clamp_(0, 4.6052)
         logit_scale = utils.get_model(model).logit_scale.exp().item()
 
         metrics['loss'].update(loss.item())
         metrics['acc'].update(acc.item())
 
-        # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
         mem.update(torch.cuda.max_memory_allocated() // 1e9)
 
         if optim_iter % args.print_freq == 0:
-            # if utils.is_main_process() and args.wandb:
-            #     wandb.log({**{'loss': loss.item(), 'acc': acc.item()},
-            #             'logit': logit_scale})
             progress.display(optim_iter)
 
     progress.synchronize()
@@ -233,8 +221,8 @@ def train(train_loader, model, criterion, optimizer, epoch, lr_scheduler, args):
             'lr': optimizer.param_groups[0]['lr'],
             'logit_scale': logit_scale}
 
-
 def validate(test_loader, model, criterion, args):
+    print("Starting validation...")
     batch_time = AverageMeter('Time', ':6.3f')
     val_top1 = AverageMeter('Acc@1', ':6.2f')
     val_loss = AverageMeter('Acc@5', ':6.2f')
@@ -243,41 +231,31 @@ def validate(test_loader, model, criterion, args):
         [batch_time, val_top1, val_loss],
         prefix='Test: ')
 
-    # switch to evaluate mode
     model.eval()
-
     with torch.no_grad():
         end = time.time()
         per_class_stats = collections.defaultdict(int)
         per_class_correct_top1 = collections.defaultdict(int)
 
         for i, inputs in enumerate(test_loader):
-            pc = inputs[0]  # [batch, npoints, 3]
-            target = inputs[1]  # [batch,]
-            target_name = inputs[2] # [batch]
+            pc = inputs[0].to(args.gpu)
+            target = inputs[1].long().to(args.gpu)
+            target_name = inputs[2]
 
             for name in target_name:
                 per_class_stats[name] += 1
 
-            pc = pc.cuda(args.gpu)
-            target = target.long().cuda(args.gpu)
-
-            # [batch, num_classes]
             pred = model(pc)
             loss = criterion(pred, target)
-
-            # compute top1 only
             res, correct = accuracy(pred, target, topk=(1,))
             acc = res[0]
 
             val_loss.update(loss.item(), pc.size(0))
             val_top1.update(acc.item(), pc.size(0))
 
-            # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
 
-            # [batch]
             top1_accurate = correct[:1].squeeze()
             for idx, name in enumerate(target_name):
                 if top1_accurate[idx].item():
@@ -295,11 +273,10 @@ def validate(test_loader, model, criterion, args):
         print(','.join([str(value) for value in top1_accuracy_per_class.values()]))
 
     progress.synchronize()
-    print('Test * Acc@1 {top1.avg:.3f} Loss {val_loss.avg:.3f}')
+    print(f'Test * Acc@1 {val_top1.avg:.3f} Loss {val_loss.avg:.3f}')
     return {'acc': val_top1.avg, 'loss': val_loss.avg}
 
 
 if __name__ == '__main__':
     from parser import args
-
     main(args)

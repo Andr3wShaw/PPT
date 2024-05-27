@@ -68,7 +68,7 @@ class Transformer(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, token_embeding, kwargs):
+    def __init__(self, token_embedding, kwargs):
         super().__init__()
 
         self.class_name_position = kwargs.class_name_position
@@ -78,7 +78,7 @@ class PromptLearner(nn.Module):
         self.device = kwargs.device
 
         if kwargs.template_init != '':
-            template_init = kwargs.template_init.replace("_", " ")  # 这一步很重要，把带下划线的短语进行切分
+            template_init = kwargs.template_init.replace("_", " ")  
             self.num_learnable_prompt_tokens = len(template_init.split(' '))
             prompt_prefix = template_init
         else:
@@ -87,28 +87,21 @@ class PromptLearner(nn.Module):
 
         self.learnable_tokens = nn.Parameter(torch.empty(self.num_learnable_prompt_tokens, self.transformer_width))
 
-        classnames = [name.replace("_", " ") for name in self.classnames]   # "nigth_stand" -> "night stand"
+        classnames = [name.replace("_", " ") for name in self.classnames]  
         tokenizer = SimpleTokenizer()
-        # [num_classes]
-        self.name_lengths = [len(tokenizer.encode(name)) for name in classnames]   # 每个classname bpe编码的长度
-        # [num_classes]
-        prompts = [prompt_prefix + " " + name + "." for name in classnames] # 相当于每个类对应一个 prompt
+        self.name_lengths = [len(tokenizer.encode(name)) for name in classnames]  
+        prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
-        # tokenizer(p) -> [context_length]
-        # [tokenizer(p) for p in prompts]   ->  是一个list，共有 `n_cls` 个tensor，每个tensor维度：[1, context_length]
-        # tokenized_prompts -> [num_classes, context_length]
         self.tokenized_prompts = torch.stack([tokenizer(p) for p in prompts])
-        # [num_classes, context_length, transformer_width]
-        self.embedding = token_embeding(self.tokenized_prompts).cuda(device=self.device)    # 一次性转移到指定设备上
+        self.embedding = token_embedding(self.tokenized_prompts).to(self.device)
 
     def forward(self):
-
         num_classes = self.embedding.shape[0]
         if self.learnable_tokens.dim() == 2:
-            learnable_tokens = self.learnable_tokens.unsqueeze(0).repeat(num_classes, 1, 1)
+            learnable_tokens = self.learnable_tokens.unsqueeze(0).repeat(num_classes, 1, 1).to(self.device)
 
-        prefix = self.embedding[:, :1, :]   # 句子开头标记
-        suffix = self.embedding[:, 1+self.num_learnable_prompt_tokens:, :]  # 句子结尾标记
+        prefix = self.embedding[:, :1, :]   
+        suffix = self.embedding[:, 1+self.num_learnable_prompt_tokens:, :]  
 
         if self.class_name_position == "front":
             prompts = []
@@ -147,24 +140,44 @@ class PromptLearner(nn.Module):
         else:
             raise ValueError(f'`class_name_position`: {self.class_name_position} not in supported modes ["front", "middle", "end"]')
 
-        # [num_classes, context_length, transformer_width]
-        return prompts
+        return prompts.to(self.device)
 
+class PromptLearner3D(nn.Module):
+    def __init__(self, point_encoder, kwargs):
+        super(PromptLearner3D, self).__init__()
+        self.point_encoder = point_encoder
+        self.context_length = kwargs.context_length
+        self.token_embedding = nn.Parameter(torch.randn(self.context_length, kwargs.pc_feat_dims))
+        self.learnable_tokens = nn.Parameter(torch.randn(self.context_length, kwargs.pc_feat_dims))
+
+    def forward(self, point_cloud, cls_label=None):
+        batch_size = point_cloud.size(0)
+        context = self.learnable_tokens.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Ensure point_cloud has the shape [B, N, C]
+        print(f"Initial point_cloud shape: {point_cloud.shape}")
+        if point_cloud.dim() == 2:  # Assuming point_cloud has shape [batch_size, feature_dim]
+            point_cloud = point_cloud.view(batch_size, -1, 3)  # Change shape to [batch_size, N, 3]
+        print(f"Reshaped point_cloud shape: {point_cloud.shape}")
+
+        pc_feat = self.point_encoder(point_cloud)  # Encode the point cloud to get features
+        print(f"pc_feat shape after point_encoder: {pc_feat.shape}")
+
+        # Reshape pc_feat to match context dimensions if necessary
+        if pc_feat.dim() == 2:  # Assuming pc_feat has shape [batch_size, feature_dim]
+            pc_feat = pc_feat.unsqueeze(1)  # Change shape to [batch_size, 1, feature_dim]
+        print(f"Reshaped pc_feat shape: {pc_feat.shape}")
+
+        combined = torch.cat([context, pc_feat], dim=1)  # Concatenate learnable tokens with point cloud features
+        print(f"combined shape: {combined.shape}")
+        return combined
 
 class ULIP_WITH_IMAGE(nn.Module):
     def __init__(self, point_encoder, **kwargs):
-        '''
-            NOTE 
-                1. text model defined in __init__ function
-                2. image encoder is not necessary for my situation
-        '''
-        # super().__init__(ssl_mlp_dim, ssl_emb_dim, **kwargs)
         super().__init__()
         kwargs = EasyDict(kwargs)
         self.task = kwargs.task
         self.context_length = kwargs.context_length
-        # self.vision_width = kwargs.vision_width
-        # self.visual = kwargs.vision_model
         self.device = kwargs.device
 
         self.transformer = Transformer(
@@ -179,11 +192,9 @@ class ULIP_WITH_IMAGE(nn.Module):
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, kwargs.transformer_width))
         self.ln_final = LayerNorm(kwargs.transformer_width)
 
-        # self.image_projection = nn.Parameter(torch.empty(kwargs.vision_width, kwargs.embed_dim))
         self.text_projection = nn.Parameter(torch.empty(kwargs.transformer_width, kwargs.embed_dim))
         self.pc_projection = nn.Parameter(torch.empty(kwargs.pc_feat_dims, kwargs.embed_dim))
-        # --- where is it from?
-        #   把 logit_scale 设成了可学习参数，读一下论文，看看是怎么讲的
+
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         self.point_encoder = point_encoder
@@ -192,47 +203,16 @@ class ULIP_WITH_IMAGE(nn.Module):
         self.prompt_learner = PromptLearner(self.token_embedding, kwargs)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
 
+        # 3D prompt learner
+        self.prompt_learner_3d = PromptLearner3D(self.point_encoder, kwargs)
+
         self.initialize_parameters()
-
-    # def encode_image(self, image):
-    #     x = self.visual(image)
-    #     x = x @ self.image_projection
-
-    #     return x
-
-    def encode_text(self, prompts, tokenized_prompts):
-        '''
-            prompts: [num_classes, context_length, transformer_width]
-            tokenized_prompts: [num_classes, context_length]
-        '''
-
-        x = prompts + self.positional_embedding.unsqueeze(dim=0).repeat(prompts.shape[0], 1, 1)
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x)
-
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        # 用末尾的 token embedding 代表整个 prompt 的特征，这在多个论文都提到过我记得，比如 learning to prompt for vision-language models
-        #   x[torch.arange(x.shape[0]), text.argmax(dim=-1)] -> [num_classes, transformer_width]
-        #   self.text_projection                             -> [transformer_width, embed_dim]
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
-        # x: [num_classes, embed_dim]
-        return x
-
-    def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the vision tokens
-        # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(self.context_length, self.context_length)
-        mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
-        return mask
 
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
         nn.init.normal_(self.prompt_learner.learnable_tokens, std=0.02)
+        nn.init.normal_(self.prompt_learner_3d.learnable_tokens, std=0.02)
 
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
@@ -243,45 +223,65 @@ class ULIP_WITH_IMAGE(nn.Module):
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-        # nn.init.normal_(self.image_projection, std=self.vision_width ** -0.5)
         nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
         nn.init.normal_(self.pc_projection, std=512 ** -0.5)
 
-    def encode_pc(self, pc, cls_label=None):
+    def build_attention_mask(self):
+        mask = torch.empty(self.context_length, self.context_length)
+        mask.fill_(float("-inf"))
+        mask.triu_(1)
+        return mask
+
+    def encode_text(self, prompts, tokenized_prompts):
+        x = prompts + self.positional_embedding.unsqueeze(dim=0).repeat(prompts.shape[0], 1, 1)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_final(x)
+
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
+        return x
+
+    def encode_pc(self, pc, pc_prompts, cls_label=None):
+        # Use the original point cloud data with the point_encoder
         if self.task == 'partseg':
-            # [batch, npoints, num_parts]
             pc_feat = self.point_encoder(pc, cls_label)
         else:
-            # [batch, num_classes]
             pc_feat = self.point_encoder(pc)
+
+        # Project the point cloud features
         pc_embed = pc_feat @ self.pc_projection
-        return pc_embed
+
+        # Combine the point cloud embeddings with the context tokens
+        context_combined = pc_prompts @ self.pc_projection
+
+        # Sum the context_combined and pc_embed
+        combined_embed = context_combined + pc_embed.unsqueeze(1)
+
+        return combined_embed
 
     def forward(self, pc, cls_label=None):
         if self.task == 'partseg':
-            # pc:    (batch, n_points, 3)
-            # pc_embed: [batch, embed_dim]
-            pc_embed = self.encode_pc(pc, cls_label)
+            pc_prompts = self.prompt_learner_3d(pc, cls_label)
         else:
-            # pc:    (batch, n_points, 3)
-            # pc_embed: [batch, embed_dim]
-            pc_embed = self.encode_pc(pc)
+            pc_prompts = self.prompt_learner_3d(pc)
 
-        # prompts: [num_classes, context_length, transformer_width]
-        prompts = self.prompt_learner() # forward pass
-        # tokenized_prompts: [num_classes, context_length]
+        # Use the original point cloud data for point_encoder
+        pc_embed = self.encode_pc(pc, pc_prompts)
+
+        # Average the combined embeddings across the token dimension
+        pc_embed = pc_embed.mean(dim=1)
+
+        prompts = self.prompt_learner()  # forward pass
         tokenized_prompts = self.tokenized_prompts
 
-        # text_embed: [num_classes, embed_dim]
         text_embed = self.encode_text(prompts, tokenized_prompts)
         text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
-        
+
         logit_scale = self.logit_scale.exp()
-        # logits: [batch, num_classes]
         logits = logit_scale * pc_embed @ text_embed.t()
 
         return logits
-
 
 def get_loss():
     return losses.ULIPWithImageLoss()
@@ -439,78 +439,68 @@ def ULIP_PN_MLP(args):
 
     return model
 
-
 def ULIP_PointBERT(args):
-    # NOTE for prompting ULIP, we do not need image encoder. Text and point encoder is enough.
-    # vision_model = timm.create_model('vit_base_patch16_224', num_classes=0)
-
-    # =====================================================================
-    # import the 3D backbone and specify the output point cloud feature dimension
     from models.pointbert.point_encoder import PointTransformer
     config_addr = './models/pointbert/PointTransformer_8192point.yaml'
     config = cfg_from_yaml_file(config_addr)
     point_encoder = PointTransformer(config.model, args=args)
     pc_feat_dims = 768
-    # =====================================================================
 
     model = ULIP_WITH_IMAGE(embed_dim=512, point_encoder=point_encoder, context_length=77, 
             vocab_size=49408, classnames=args.classnames, template_init=args.template_init, class_name_position=args.class_name_position, 
             num_learnable_prompt_tokens=args.num_learnable_prompt_tokens, transformer_width=512, transformer_heads=8, transformer_layers=12, 
             pc_feat_dims=pc_feat_dims, device=args.gpu, task=args.task)
 
-    unfreeze_modules = [] # prompt_only
-    if args.head_type > 0: # linear
+    unfreeze_modules = []  # prompt_only
+    if args.head_type > 0:  # linear
         unfreeze_modules += ['point_encoder.blocks.blocks.11.norm2.weight', 'point_encoder.blocks.blocks.11.norm2.bias',
-                        'point_encoder.blocks.blocks.11.mlp.fc2.weight', 'point_encoder.blocks.blocks.11.mlp.fc2.bias']
+                             'point_encoder.blocks.blocks.11.mlp.fc2.weight', 'point_encoder.blocks.blocks.11.mlp.fc2.bias']
     if args.head_type > 1:  # mlp
-        unfreeze_modules += ['point_encoder.blocks.blocks.11.norm1.weight', 'point_encoder.blocks.blocks.11.norm1.bias', 
-                        'point_encoder.blocks.blocks.11.mlp.fc1.weight', 'point_encoder.blocks.blocks.11.mlp.fc1.bias']
-    if args.head_type > 2: # atten_block
+        unfreeze_modules += ['point_encoder.blocks.blocks.11.norm1.weight', 'point_encoder.blocks.blocks.11.norm1.bias',
+                             'point_encoder.blocks.blocks.11.mlp.fc1.weight', 'point_encoder.blocks.blocks.11.mlp.fc1.bias']
+    if args.head_type > 2:  # atten_block
         unfreeze_modules += ['point_encoder.blocks.blocks.11.attn.qkv.weight', 'point_encoder.blocks.blocks.11.attn.proj.weight',
-                            'point_encoder.blocks.blocks.11.attn.proj.bias']
+                             'point_encoder.blocks.blocks.11.attn.proj.bias']
 
     if not args.evaluate_3d:
-        # load the pretrained model
         if args.ulip2:
-            pretrain_point_model = torch.load('./data/pretrained_models/pointbert_ulip2.pt', map_location=torch.device('cpu'))
+            pretrain_point_model = torch.load('./data/pretrained_models/pointbert_ulip2.pt', map_location='cpu')
         else:
-            pretrain_point_model = torch.load('./data/pretrained_models/pointbert.pt', map_location=torch.device('cpu'))
+            pretrain_point_model = torch.load('./data/pretrained_models/pointbert.pt', map_location='cpu')
         pretrain_point_model_params = pretrain_point_model['state_dict']
         pretrain_point_model_params = {param_name.replace('module.', ''): param for param_name, param in
-                                      pretrain_point_model_params.items()}
-        
-        pretrain_slip_model = torch.load('./data/initialize_models/slip_base_100ep.pt', map_location=torch.device('cpu'))
+                                       pretrain_point_model_params.items()}
+
+        pretrain_slip_model = torch.load('./data/initialize_models/slip_base_100ep.pt', map_location='cpu')
         pretrain_slip_model_params = pretrain_slip_model['state_dict']
         pretrain_slip_model_params = {param_name.replace('module.', ''): param for param_name, param in
                                       pretrain_slip_model_params.items()}
 
-        for name, param in model.named_parameters():    # `model` does not have parameter for image encoder
-            if name == 'prompt_learner.learnable_tokens' or 'point_encoder.cls_head' in name: 
+        for name, param in model.named_parameters():
+            if name in ['prompt_learner.learnable_tokens', 'prompt_learner_3d.learnable_tokens', 'point_encoder.cls_head']:
                 continue
 
-            if name in unfreeze_modules:  # 打开 transformer 最后一个 block，让参数更新
+            if name in unfreeze_modules:  # Allow the last block of transformer to update
                 continue
 
             if name in pretrain_point_model_params:
-                if isinstance(pretrain_point_model_params[name], Parameter):
-                    param_new = pretrain_point_model_params[name].data
-                else:
-                    param_new = pretrain_point_model_params[name]
+                param_new = pretrain_point_model_params[name].data if isinstance(pretrain_point_model_params[name], torch.nn.Parameter) else pretrain_point_model_params[name]
+                param.requires_grad = False
+                param.data.copy_(param_new)
+                print('load {} from pretrain_point_model_params and freeze'.format(name))
+            elif name in pretrain_slip_model_params:
+                param_new = pretrain_slip_model_params[name].data if isinstance(pretrain_slip_model_params[name], torch.nn.Parameter) else pretrain_slip_model_params[name]
+                param.requires_grad = False
+                param.data.copy_(param_new)
+                print('load {} from pretrain_slip_model_params and freeze'.format(name))
             else:
-                if isinstance(pretrain_slip_model_params[name], Parameter):
-                    param_new = pretrain_slip_model_params[name].data
-                else:
-                    param_new = pretrain_slip_model_params[name]
-
-            param.requires_grad = False
-            print('load {} and freeze'.format(name))
-            param.data.copy_(param_new)
+                print('parameter {} not found in pretrained models, initializing randomly'.format(name))
+                param.requires_grad = True  # Allow updating this parameter
 
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('\n====================\n\tNumber of learnable params:', params, '\n====================\n')
 
     return model
-
 
 def ULIP_PointBERT_partseg(args):
     CUR_DIR = os.path.dirname(os.path.abspath(__file__)) # current dir
