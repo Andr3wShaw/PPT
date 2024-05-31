@@ -149,27 +149,26 @@ class PromptLearner3D(nn.Module):
         self.context_length = kwargs.context_length
         self.token_embedding = nn.Parameter(torch.randn(self.context_length, kwargs.pc_feat_dims))
         self.learnable_tokens = nn.Parameter(torch.randn(self.context_length, kwargs.pc_feat_dims))
+        self.task = kwargs.task
 
     def forward(self, point_cloud, cls_label=None):
         batch_size = point_cloud.size(0)
         context = self.learnable_tokens.unsqueeze(0).expand(batch_size, -1, -1)
 
         # Ensure point_cloud has the shape [B, N, C]
-        print(f"Initial point_cloud shape: {point_cloud.shape}")
         if point_cloud.dim() == 2:  # Assuming point_cloud has shape [batch_size, feature_dim]
             point_cloud = point_cloud.view(batch_size, -1, 3)  # Change shape to [batch_size, N, 3]
-        print(f"Reshaped point_cloud shape: {point_cloud.shape}")
 
-        pc_feat = self.point_encoder(point_cloud)  # Encode the point cloud to get features
-        print(f"pc_feat shape after point_encoder: {pc_feat.shape}")
+        if self.task == 'partseg':
+            pc_feat = self.point_encoder(point_cloud, cls_label)  # Encode the point cloud to get features
+        else:
+            pc_feat = self.point_encoder(point_cloud)
 
         # Reshape pc_feat to match context dimensions if necessary
         if pc_feat.dim() == 2:  # Assuming pc_feat has shape [batch_size, feature_dim]
             pc_feat = pc_feat.unsqueeze(1)  # Change shape to [batch_size, 1, feature_dim]
-        print(f"Reshaped pc_feat shape: {pc_feat.shape}")
 
         combined = torch.cat([context, pc_feat], dim=1)  # Concatenate learnable tokens with point cloud features
-        print(f"combined shape: {combined.shape}")
         return combined
 
 class ULIP_WITH_IMAGE(nn.Module):
@@ -255,6 +254,12 @@ class ULIP_WITH_IMAGE(nn.Module):
         # Combine the point cloud embeddings with the context tokens
         context_combined = pc_prompts @ self.pc_projection
 
+        # Ensure the dimensions match before combining
+        if pc_embed.size(1) != context_combined.size(1):
+            min_dim = min(pc_embed.size(1), context_combined.size(1))
+            pc_embed = pc_embed[:, :min_dim]
+            context_combined = context_combined[:, :min_dim]
+
         # Sum the context_combined and pc_embed
         combined_embed = context_combined + pc_embed.unsqueeze(1)
 
@@ -267,7 +272,10 @@ class ULIP_WITH_IMAGE(nn.Module):
             pc_prompts = self.prompt_learner_3d(pc)
 
         # Use the original point cloud data for point_encoder
-        pc_embed = self.encode_pc(pc, pc_prompts)
+        if self.task == 'partseg':
+            pc_embed = self.encode_pc(pc, pc_prompts, cls_label)
+        else:
+            pc_embed = self.encode_pc(pc, pc_prompts)
 
         # Average the combined embeddings across the token dimension
         pc_embed = pc_embed.mean(dim=1)
@@ -446,21 +454,39 @@ def ULIP_PointBERT(args):
     point_encoder = PointTransformer(config.model, args=args)
     pc_feat_dims = 768
 
-    model = ULIP_WITH_IMAGE(embed_dim=512, point_encoder=point_encoder, context_length=77, 
-            vocab_size=49408, classnames=args.classnames, template_init=args.template_init, class_name_position=args.class_name_position, 
-            num_learnable_prompt_tokens=args.num_learnable_prompt_tokens, transformer_width=512, transformer_heads=8, transformer_layers=12, 
-            pc_feat_dims=pc_feat_dims, device=args.gpu, task=args.task)
+    model = ULIP_WITH_IMAGE(
+        embed_dim=512,
+        point_encoder=point_encoder,
+        context_length=77, 
+        vocab_size=49408,
+        classnames=args.classnames,
+        template_init=args.template_init,
+        class_name_position=args.class_name_position, 
+        num_learnable_prompt_tokens=args.num_learnable_prompt_tokens,
+        transformer_width=512,
+        transformer_heads=8,
+        transformer_layers=12, 
+        pc_feat_dims=pc_feat_dims,
+        device=args.gpu,
+        task=args.task
+    )
 
     unfreeze_modules = []  # prompt_only
     if args.head_type > 0:  # linear
-        unfreeze_modules += ['point_encoder.blocks.blocks.11.norm2.weight', 'point_encoder.blocks.blocks.11.norm2.bias',
-                             'point_encoder.blocks.blocks.11.mlp.fc2.weight', 'point_encoder.blocks.blocks.11.mlp.fc2.bias']
+        unfreeze_modules += [
+            'point_encoder.blocks.blocks.11.norm2.weight', 'point_encoder.blocks.blocks.11.norm2.bias',
+            'point_encoder.blocks.blocks.11.mlp.fc2.weight', 'point_encoder.blocks.blocks.11.mlp.fc2.bias'
+        ]
     if args.head_type > 1:  # mlp
-        unfreeze_modules += ['point_encoder.blocks.blocks.11.norm1.weight', 'point_encoder.blocks.blocks.11.norm1.bias',
-                             'point_encoder.blocks.blocks.11.mlp.fc1.weight', 'point_encoder.blocks.blocks.11.mlp.fc1.bias']
+        unfreeze_modules += [
+            'point_encoder.blocks.blocks.11.norm1.weight', 'point_encoder.blocks.blocks.11.norm1.bias',
+            'point_encoder.blocks.blocks.11.mlp.fc1.weight', 'point_encoder.blocks.blocks.11.mlp.fc1.bias'
+        ]
     if args.head_type > 2:  # atten_block
-        unfreeze_modules += ['point_encoder.blocks.blocks.11.attn.qkv.weight', 'point_encoder.blocks.blocks.11.attn.proj.weight',
-                             'point_encoder.blocks.blocks.11.attn.proj.bias']
+        unfreeze_modules += [
+            'point_encoder.blocks.blocks.11.attn.qkv.weight', 'point_encoder.blocks.blocks.11.attn.proj.weight',
+            'point_encoder.blocks.blocks.11.attn.proj.bias'
+        ]
 
     if not args.evaluate_3d:
         if args.ulip2:
@@ -503,45 +529,51 @@ def ULIP_PointBERT(args):
     return model
 
 def ULIP_PointBERT_partseg(args):
-    CUR_DIR = os.path.dirname(os.path.abspath(__file__)) # current dir
-    PROJ_DIR = os.path.dirname(CUR_DIR) # project dir
-    # vision_model = timm.create_model('vit_base_patch16_224', num_classes=0)
+    CUR_DIR = os.path.dirname(os.path.abspath(__file__))  # current dir
+    PROJ_DIR = os.path.dirname(CUR_DIR)  # project dir
 
-    # =====================================================================
-    # import the 3D backbone and specify the output point cloud feature dimension
     from models.pointbert.point_encoder import PointTransformer_partseg
     config_addr = os.path.join(PROJ_DIR, 'models/pointbert/PointTransformer_8192point.yaml')
     config = cfg_from_yaml_file(config_addr)
     point_encoder = PointTransformer_partseg(config.model, args=args)
     pc_feat_dims = 128
-    # =====================================================================
 
-    model = ULIP_WITH_IMAGE(embed_dim=512, point_encoder=point_encoder, context_length=77, 
-            vocab_size=49408, classnames=args.classnames, template_init=args.template_init, class_name_position=args.class_name_position, 
-            num_learnable_prompt_tokens=args.num_learnable_prompt_tokens, transformer_width=512, transformer_heads=8, transformer_layers=12, 
-            pc_feat_dims=pc_feat_dims, device=args.gpu, task=args.task)
+    kwargs = EasyDict({
+        "context_length": 77,
+        "pc_feat_dims": pc_feat_dims,
+        "cls_dim": point_encoder.cls_dim,  # Ensure this matches the expected cls_dim
+        "embed_dim": 512,
+        "vocab_size": 49408,
+        "classnames": args.classnames,
+        "template_init": args.template_init,
+        "class_name_position": args.class_name_position,
+        "num_learnable_prompt_tokens": args.num_learnable_prompt_tokens,
+        "transformer_width": 512,
+        "transformer_heads": 8,
+        "transformer_layers": 12,
+        "device": args.gpu,
+        "task": args.task,
+    })
+
+    model = ULIP_WITH_IMAGE(point_encoder=point_encoder, **kwargs)
 
     count = 0
     if not args.evaluate_3d:
-        # load the pretrained model
         if args.ulip2:
             pretrain_point_model = torch.load(os.path.join(PROJ_DIR, 'data/pretrained_models/pointbert_ulip2.pt'), map_location=torch.device('cpu'))
         else:
             pretrain_point_model = torch.load(os.path.join(PROJ_DIR, 'data/pretrained_models/pointbert.pt'), map_location=torch.device('cpu'))
         pretrain_point_model_params = pretrain_point_model['state_dict']
-        pretrain_point_model_params = {param_name.replace('module.', ''): param for param_name, param in
-                                      pretrain_point_model_params.items()}
-        
+        pretrain_point_model_params = {param_name.replace('module.', ''): param for param_name, param in pretrain_point_model_params.items()}
+
         pretrain_slip_model = torch.load(os.path.join(PROJ_DIR, 'data/initialize_models/slip_base_100ep.pt'), map_location=torch.device('cpu'))
         pretrain_slip_model_params = pretrain_slip_model['state_dict']
-        pretrain_slip_model_params = {param_name.replace('module.', ''): param for param_name, param in
-                                      pretrain_slip_model_params.items()}
+        pretrain_slip_model_params = {param_name.replace('module.', ''): param for param_name, param in pretrain_slip_model_params.items()}
 
         for name, param in model.named_parameters():
             if name.startswith('prompt_learner'):
                 count += 1
                 print('------ prompt_learner params:', name)
-
             elif name.startswith('point_encoder.'):
                 if name in pretrain_point_model_params:
                     param.requires_grad = False
@@ -549,15 +581,13 @@ def ULIP_PointBERT_partseg(args):
                 else:
                     count += 1
                     print('------ pointbert_partseg params:', name)
-
-            else:   # image and text encoder
+            else:
                 param.requires_grad = False
                 print('load {} and freeze'.format(name))
 
         print(f'>>>>>> {count}')
 
     return model
-
 
 def ULIP_PN_NEXT(args):
     # vision_model = timm.create_model('vit_base_patch16_224', num_classes=0)
