@@ -22,7 +22,7 @@ import collections
 from data.dataset_3d import *
 
 from utils.utils import set_random_seed, get_dataset, accuracy, AverageMeter, ProgressMeter
-import models.ULIP_models as models
+import models.ULIP_models_og as models
 from utils.tokenizer import SimpleTokenizer
 from utils import utils
 
