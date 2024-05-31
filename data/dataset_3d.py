@@ -21,7 +21,12 @@ from utils.logger import *
 from utils.build import build_dataset_from_cfg
 import json
 import pickle
+import plyfile
 from PIL import Image
+
+from nuscenes.nuscenes import NuScenes
+from nuscenes.utils.data_classes import LidarPointCloud
+from nuscenes.utils.splits import create_splits_scenes
 
 
 def pil_loader(path):
@@ -759,6 +764,124 @@ class ShapeNetPart(data.Dataset):
     def __len__(self):
         return len(self.datapath)
 
+@DATASETS.register_module()
+class nuscenes(data.Dataset):
+    def __init__(self, config):
+        self.data_path = config.DATA_PATH
+        self.class_choice = config.class_choice
+        self.normal_channel = config.normal_channel
+        self.npoints = config.npoints
+        self.split = config.split
+
+        self.data, self.labels = self.load_nuscenes_data()
+
+        self.part2category = {i: label for i, label in enumerate(config.class_choice)}
+        self.category2part = {label: [i] for i, label in enumerate(config.class_choice)}
+
+    def load_nuscenes_data(self):
+        data = []
+        labels = []
+
+        split_file = os.path.join(self.data_path, 'v1.0-trainval', 'lidarseg.json')
+        print(f"Looking for split file at: {split_file}")
+        with open(split_file, 'r') as f:
+            split_data = json.load(f)
+
+        for item in split_data:
+            points_file = os.path.join(self.data_path, item['filename'])
+            labels_file = os.path.join(self.data_path, item['filename'])
+
+            print(f"Loading points from: {points_file}")
+            print(f"Loading labels from: {labels_file}")
+
+            points = np.fromfile(points_file, dtype=np.float32)
+            labels = np.fromfile(labels_file, dtype=np.uint8)
+
+            print(f"Loaded points shape: {points.shape}")
+            print(f"Loaded labels shape: {labels.shape}")
+
+            # Ensure the number of points and labels match
+            num_points = points.size // 5  # Each point should have 5 attributes
+            if num_points * 5 != points.size:
+                raise ValueError(f"Unexpected number of points in file {points_file}. Cannot reshape array of size {points.size} into shape (5).")
+
+            points = points.reshape(num_points, 5)
+            labels = labels[:num_points]  # Match number of labels to points
+
+            data.append(points)
+            labels.append(labels)
+
+        return data, labels
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        pointcloud = self.data[index]
+        label = self.labels[index]
+
+        if len(pointcloud) > self.npoints:
+            pointcloud = farthest_point_sample(pointcloud, self.npoints)
+
+        if not self.normal_channel:
+            pointcloud = pointcloud[:, :3]
+
+        pointcloud[:, :3] = pc_normalize(pointcloud[:, :3])
+
+        return pointcloud, label.tolist()
+    
+@DATASETS.register_module()
+class KITTI360(data.Dataset):
+    def __init__(self, config):
+        self.root = config.DATA_PATH
+        self.npoints = config.npoints
+        self.split = config.split
+        self.num_classes = config.NUM_CLASSES
+
+        self.train_files = os.path.join(self.root, config.TRAIN_FILES)
+        self.val_files = os.path.join(self.root, config.VAL_FILES)
+        self.test_files = os.path.join(self.root, config.TEST_FILES)
+
+        if self.split == 'train':
+            self.file_list = self.load_files(self.train_files)
+        elif self.split == 'val':
+            self.file_list = self.load_files(self.val_files)
+        elif self.split == 'test':
+            self.file_list = self.load_files(self.test_files)
+        else:
+            raise ValueError("Invalid split name")
+
+        self.data = self.load_data()
+
+    def load_files(self, file_list):
+        with open(file_list, 'r') as f:
+            files = [line.strip() for line in f]
+        return files
+
+    def load_ply(self, file_path):
+        plydata = plyfile.PlyData.read(file_path)
+        data = np.array([list(vertex) for vertex in plydata.elements[0].data])
+        return data
+
+    def load_data(self):
+        data = []
+        for file in self.file_list:
+            full_path = os.path.join('data/KITTI-360', file)
+            if os.path.exists(full_path):
+                data.append(self.load_ply(full_path))
+            else:
+                print(f"File not found: {full_path}")
+        return data
+
+    def __getitem__(self, index):
+        pointcloud = self.data[index]
+        if len(pointcloud) > self.npoints:
+            pointcloud = farthest_point_sample(pointcloud, self.npoints)
+        pointcloud[:, :3] = pc_normalize(pointcloud[:, :3])
+        return pointcloud
+
+    def __len__(self):
+        return len(self.data)
 
 import collections.abc as container_abcs
 int_classes = int
@@ -860,7 +983,7 @@ class Dataset_3D():
         with open(os.path.join(PROJ_DIR, 'data/dataset_catalog.json'), 'r') as f:
             self.dataset_catalog = json.load(f)
             self.dataset_config_dir = self.dataset_catalog[self.dataset_name]['config']
-        self.build_3d_dataset(args, self.dataset_config_dir)    # 第二个参数仅是一个yaml文件目录，不要被下面函数定义迷惑
+        self.build_3d_dataset(args, self.dataset_config_dir)
 
     def build_3d_dataset(self, args, dataset_config_dir):
         config = cfg_from_yaml_file(dataset_config_dir)

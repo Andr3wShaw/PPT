@@ -1,0 +1,7 @@
+NAME: nuscenes
+DATA_PATH: /mnt/c/Users/Andrew/Desktop/code/Andrew-Shaw-EGH400/PPT/data/nuscenes
+class_choice: ["noise","barrier","bicycle","bus","car","construction_vehicle","motorcycle","pedestrian","traffic_cone","trailer","truck","driveable_surface","other_flat","sidewalk","terrain","manmade","vegetation"]
+npoints: 2048
+normal_channel: False
+use_height: False
+split: train

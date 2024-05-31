@@ -1,0 +1,7 @@
+NAME: KITTI360
+DATA_PATH: data/KITTI-360/data_3d_semantics
+NUM_CLASSES: 19
+TRAIN_FILES: train/2013_05_28_drive_train.txt
+VAL_FILES: train/2013_05_28_drive_val.txt
+TEST_FILES: test/2013_05_28_drive_test.txt
+USE_NORMALS: False

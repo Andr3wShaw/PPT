@@ -158,5 +158,46 @@
         "sofa",
         "table",
         "toilet"
+    ],
+    "nuscenes": [
+        "noise",
+        "barrier",
+        "bicycle",
+        "bus",
+        "car",
+        "construction_vehicle",
+        "motorcycle",
+        "pedestrian",
+        "traffic_cone",
+        "trailer",
+        "truck",
+        "driveable_surface",
+        "other_flat",
+        "sidewalk",
+        "terrain",
+        "manmade",
+        "vegetation"
+    ],
+    "KITTI360": [
+        "road",
+        "sidewalk",
+        "building",
+        "wall",
+        "fence",
+        "pole",
+        "traffic light",
+        "traffic sign",
+        "vegetation",
+        "terrain",
+        "sky",
+        "person",
+        "rider",
+        "car",
+        "truck",
+        "bus",
+        "train",
+        "motorcycle",
+        "bicycle"
     ]
+    
 }
